@@ -1,0 +1,165 @@
+from statsmodels.tools.sm_exceptions import EstimationWarning
+from statsmodels.tsa.regime_switching.markov_switching import cy_hamilton_filter_log, cy_kim_smoother_log
+import warnings
+import data
+import numpy as np
+from matrix_operations import vec_matrix, replace_diagonal
+from scipy.linalg import sqrtm
+
+
+class HmmSvar:
+    def __init__(self, initial_prob, transition_prob, lags, regimes, beta_hat=None):
+        """
+        :param endog:
+        :param exog:
+        :param initial_prob:
+        :param transition_prob:
+        :param lags:
+        :param regimes:
+        """
+        self.kim_result = None
+        self.smoothed_marg_prob = None
+        self.smoothed_joint_prob = None
+        self.log_likelihoods = None
+        self.log_eta = None
+        self.initial_prob = initial_prob
+        self.transition_prob = transition_prob
+        self.endog = None
+        self.exog = None
+        self.log_eta = None
+        self.lags = lags
+        self.k_regimes = regimes
+        self.beta_hat = beta_hat
+
+    def start_params(self):
+        """
+        :param number_regimes: Number of regimes in the model
+        :param no_lags:  Number of lags in the VECM estimates
+        :param beta_hat: Default None, uses journalese procedure to tabulate
+        :return:
+        delta_y_t: endogenous variable
+        z_t_1: right-hand variable
+        ols_resid:  residuals from the initial OLS estimates of the VECM model
+        """
+
+        self.endog, self.exog, ols_resid = data.data_matrix(data.df, self.lags, self.beta_hat)
+        k, obs = self.endog.shape
+
+        # temp array to save u u.T values
+        u_u = np.zeros([k * k, obs])
+        # tabulate log squared residuals using the residuals
+        for t in range(obs):
+            u = ols_resid[:, t]
+            u_u[:, t] = np.repeat(u, k) * np.tile(u, k)
+        b_matrix = sqrtm(vec_matrix(u_u.sum(axis=1) / obs))
+        b_matrix = b_matrix + np.random.normal(0, 0.001, size=(k, k))
+        lam = replace_diagonal(np.random.normal(1, 0, size=k))
+        sigma_array = np.zeros([self.k_regimes, k, k])
+        for regime in range(self.k_regimes):
+            if regime == 0:
+                sigma_array[regime, :, :] = b_matrix @ b_matrix.T
+            else:
+                sigma_array[regime, :, :] = b_matrix @ lam @ b_matrix.T
+
+        initial_params = {'regimes': self.k_regimes,
+                               'epsilon_0': (np.log(np.ones(self.k_regimes) / self.k_regimes)).reshape(-1, 1),
+                               'transition_prob_mat': np.log(
+                                   np.ones([self.k_regimes, self.k_regimes]) / self.k_regimes),
+                               'B_matrix': b_matrix,
+                               'lambda_m': np.identity(b_matrix.shape[0]),
+                               'sigma': sigma_array,
+                               'residuals': ols_resid,
+                               'VECM_params': None}
+        return initial_params
+
+    def fit(self, start_params=None, transformed=True,
+            cov_kwds=None, maxiter=50, tolerance=1e-6):
+        #TODO: need taking the results from initialization
+        if start_params is None:
+            start_params = self.start_params()
+            transformed = True
+        else:
+            start_params = np.array(start_params, ndmin=1)
+
+        if not transformed:
+            raise NotImplementedError
+            # start_params = self.transform_params(start_params)
+
+        # Perform expectation-maximization
+        llf = []
+        params = [start_params]
+        i = 0
+        delta = 0
+        while i < maxiter and (i < 2 or (delta > tolerance)):
+            self.expectation()
+            self.maximization()
+            llf.append(self.log_likelihoods)
+            if i > 0:
+                delta = 2 * (llf[-1] - llf[-2]) / np.abs((llf[-1] + llf[-2]))
+            i += 1
+
+    def expectation(self):
+        # estimate eta t
+        self.log_eta = self.cond_prob_()  # TODO: not written yet
+        # filtered prob
+        hamilton_result = cy_hamilton_filter_log(self.initial_prob,
+                                                 self.transition_prob, self.log_eta,
+                                                 self.lags)
+        predicted_joint_probabilities = hamilton_result[1]
+        filtered_joint_probabilities = hamilton_result[3]
+        self.log_likelihoods = hamilton_result[2]
+
+        # smoothed prob
+        self.kim_result = cy_kim_smoother_log(self.transition_prob,
+                                              predicted_joint_probabilities,
+                                              filtered_joint_probabilities)
+
+    def maximization(self):
+        # estimate transition probabilities
+        self._em_regime_transition()
+        # estimate B and Lambda matrices
+        self.numerical_optimization()  # TODO: not written yet
+
+    def _em_regime_transition(self):
+        """
+        EM step for regime transition probabilities
+        """
+
+        # Marginalize the smoothed joint probabilities to just S_t, S_{t-1} | T
+        tmp = self.kim_result.smoothed_joint_probabilities
+        for i in range(tmp.ndim - 3):
+            tmp = np.sum(tmp, -2)
+        smoothed_joint_probabilities = tmp
+
+        # Transition parameters (recall we're not yet supporting TVTP here)
+        regime_transition = np.zeros((self.k_regimes, self.k_regimes))
+        for i in range(self.k_regimes):  # S_{t_1}
+            for j in range(self.k_regimes - 1):  # S_t
+                regime_transition[i, j] = (
+                        np.sum(self.kim_result.smoothed_joint_probabilities[j, i]) /
+                        np.sum(self.kim_result.smoothed_marginal_probabilities[i]))
+
+            # It may be the case that due to rounding error this estimates
+            # transition probabilities that sum to greater than one. If so,
+            # re-scale the probabilities and warn the user that something
+            # is not quite right
+            delta = np.sum(regime_transition[i]) - 1
+            if delta > 0:
+                warnings.warn('Invalid regime transition probabilities'
+                              ' estimated in EM iteration; probabilities have'
+                              ' been re-scaled to continue estimation.', EstimationWarning)
+                regime_transition[i] /= 1 + delta + 1e-6
+
+        return regime_transition
+
+    def cond_prob_(self):
+        raise NotImplementedError
+        """ 
+        obs = param['residuals'].shape[1]
+        conditional_prob = np.zeros([param['regimes'], obs])
+        for r in range(param['regimes']):
+            conditional_prob[r, :] = stats.multivariate_normal(mean=None,
+                                                           cov=param['sigma'][r, :, :]).logpdf(param['residuals'].T).T
+
+         return conditional_prob
+        """
