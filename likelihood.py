@@ -1,7 +1,13 @@
+from __future__ import annotations
 from statsmodels.base.model import GenericLikelihoodModel
 import numpy as np
 from matrix_operations import vec_matrix, replace_diagonal
 from statsmodels.tools.numdiff import approx_hess1, approx_hess2, approx_hess3
+from scipy import stats
+
+
+
+
 
 
 class SvarHMM(GenericLikelihoodModel):
@@ -9,15 +15,14 @@ class SvarHMM(GenericLikelihoodModel):
     def __init__(self, smoothed_prob, residuals, start_params, endog, exog, k_regimes, loglike=None,
                  score=None, hessian=None,
                  missing='none', extra_params_names=None, **kwds):
-        super(SvarHMM, self).__init__(endog=endog, exog=exog, loglike=loglike, score=score,
+        super(SvarHMM, self).__init__(endog=endog.T, exog=exog.T, loglike=loglike, score=score,
                                       hessian=hessian, missing=missing,
                                       extra_params_names=extra_params_names, kwds=kwds)
-        self.iter_num = 0
         self.residuals = residuals
         self.smoothed_prob = smoothed_prob
         self.y = np.array(self.endog)
         self.k_regimes = k_regimes
-        self.iter_num = None
+        self.iter_num = 0
         self.mu_matrix = []
 
         # The vector of initial values for all the parameters, beta and q, that the optimizer will
@@ -31,7 +36,7 @@ class SvarHMM(GenericLikelihoodModel):
 
     def nloglikeobs(self, params):
         # Reconstitute the q and beta matrices from the current values of all the params
-        sigma = self.reconstitute_parameter_matrices(params)
+        sigma = self.reconstitute_parameter_matrices(params,self.endog.shape[1])
         # Let's increment the iteration count
         self.iter_num = self.iter_num + 1
         # Compute all the log-likelihood values for the Poisson Markov model
@@ -40,9 +45,9 @@ class SvarHMM(GenericLikelihoodModel):
         # Return the negated array of  log-likelihood values
         return -ll
 
-    def reconstitute_parameter_matrices(self, params):
+    def reconstitute_parameter_matrices(self, params,endog_shape):
         regimes = self.k_regimes
-        k = self.endog.shape[0]
+        k = endog_shape 
 
         b_mat = vec_matrix(np.array(params[0:k ** 2]))
         lam_m = np.zeros([regimes - 1, k, k])
@@ -62,11 +67,11 @@ class SvarHMM(GenericLikelihoodModel):
         return sigma
 
     def compute_loglikelihood(self, sigma):
-        likelihood_array = np.zeros([self.k_regime, self.residuals.shape[1]])
-        for regime in range(self.k_regime):
+        likelihood_array = np.zeros([self.k_regimes, self.residuals.shape[1]])
+        for regime in range(self.k_regimes):
             likelihood_array[regime, :] = (self.smoothed_prob[regime, :] * stats.multivariate_normal(
-                mean=None, cov=sigma[regime, :, :], allow_singular=True).logpdf(residuals.T).T)
-        return likelihood_array.sum(axis=0)
+                mean=None, cov=sigma[regime, :, :], allow_singular=True).logpdf(self.residuals.T).T)
+        return likelihood_array.sum(axis=0).sum()
 
     # This function just tries its best to compute an invertible Hessian so that the standard
     # errors and confidence intervals of all the trained parameters can be computed successfully.
